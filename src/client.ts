@@ -1,9 +1,10 @@
-import { Keypair, VersionedTransaction } from '@solana/web3.js';
-import axios from 'axios';
+import { Keypair } from '@solana/web3.js';
+import axios, { type AxiosResponse } from 'axios';
+import { buildExactPaymentProofJsonString, type PaymentRequiredBody } from './pr402-exact-flow.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type Tier = 'hourly' | 'daily';
+export type Tier = 'hourly' | 'daily' | 'monthly';
 
 export interface OddsItem {
   matchName: string;
@@ -65,114 +66,86 @@ export interface SubscriptionInfo {
   expiresAt: Date;
 }
 
+export class FifaApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+
+  constructor(status: number, message: string, code?: string) {
+    super(message);
+    this.name = 'FifaApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const HTTP_TIMEOUT_MS = 15_000;
+
 // ── Client ───────────────────────────────────────────────────────────────────
 
 export class FifaWorldCupClient {
   private payer: Keypair;
   private endpointBaseUrl: string;
   private defaultFacilitatorUrl: string;
+  private logger?: (message: string) => void;
 
-  // In-memory subscription state — auto-renewed transparently
   private activeSubscription: SubscriptionInfo | null = null;
 
   constructor(options: {
     payerKeypair: Keypair;
-    endpointBaseUrl: string;        // e.g. https://fifa.polystrike.io/devnet
-    defaultFacilitatorUrl?: string; // e.g. https://preview.ipay.sh
+    endpointBaseUrl: string;
+    defaultFacilitatorUrl?: string;
+    logger?: (message: string) => void;
   }) {
     this.payer = options.payerKeypair;
     this.endpointBaseUrl = options.endpointBaseUrl.replace(/\/$/, '');
     this.defaultFacilitatorUrl = options.defaultFacilitatorUrl || 'https://preview.ipay.sh';
+    this.logger = options.logger;
   }
 
-  // ── Public: Subscription management ────────────────────────────────────────
+  private log(message: string): void {
+    this.logger?.(message);
+  }
 
-  /**
-   * Purchase a time-window subscription via x402.
-   * Called automatically by data methods when no valid token is held.
-   * You can also call this manually to pre-warm the subscription.
-   *
-   * @param tier  'hourly' (default) or 'daily'
-   */
   public async subscribe(tier: Tier = 'hourly'): Promise<SubscriptionInfo> {
     const url = `${this.endpointBaseUrl}/api/v1/subscribe?tier=${tier}`;
 
-    // Step 1: Probe the subscription endpoint — get x402 payment requirements
     const probeRes = await axios.post(url, {}, {
-      validateStatus: (s) => s === 200 || s === 402,
+      timeout: HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
     });
 
     if (probeRes.status === 200) {
-      // Token already accepted (edge case: server pre-auth), shouldn't normally happen
-      const data = probeRes.data as SubscribeResponse;
-      return this.storeSubscription(data);
+      return this.storeSubscription(probeRes.data as SubscribeResponse);
     }
 
     if (probeRes.status !== 402) {
-      throw new Error(`Unexpected subscribe probe status: ${probeRes.status}`);
+      throw this.apiErrorFromResponse(probeRes);
     }
 
     const requirements = probeRes.data as PaymentRequiredResponse;
+    const paymentSignatureHeader = await buildExactPaymentProofJsonString({
+      payer: this.payer,
+      requirements: requirements as unknown as PaymentRequiredBody,
+      defaultFacilitatorBaseUrl: this.defaultFacilitatorUrl,
+      timeoutMs: HTTP_TIMEOUT_MS,
+    });
 
-    // Step 2: Match payment accept line
-    const acceptLine = requirements.accepts.find(
-      (a) => a.scheme === 'exact' || a.scheme === 'v2:solana:exact',
-    );
-    if (!acceptLine) {
-      throw new Error('No supported x402 exact payment rail found in subscribe response.');
-    }
-
-    const canonicalAcceptLine = {
-      ...acceptLine,
-      scheme: acceptLine.scheme === 'v2:solana:exact' ? 'exact' : acceptLine.scheme,
-    };
-
-    const facilitatorBase =
-      requirements.extensions?.pr402FacilitatorUrl || this.defaultFacilitatorUrl;
-
-    // Step 3: Build the payment transaction via pr402 facilitator
-    const txBuildRes = await axios.post(
-      `${facilitatorBase}/api/v1/facilitator/build-exact-payment-tx`,
-      {
-        payer: this.payer.publicKey.toBase58(),
-        accepted: canonicalAcceptLine,
-        resource: requirements.resource,
-      },
-    );
-
-    const buildData = txBuildRes.data as {
-      transaction: string;
-      verifyBodyTemplate: {
-        paymentPayload: { payload: { transaction: string } };
-      };
-    };
-
-    // Step 4: Sign the transaction locally (private key never leaves this process)
-    const txBytes = Buffer.from(buildData.transaction, 'base64');
-    const vtx = VersionedTransaction.deserialize(txBytes);
-    vtx.sign([this.payer]);
-
-    const signedTxBase64 = Buffer.from(vtx.serialize()).toString('base64');
-    const verifyBody = buildData.verifyBodyTemplate;
-    verifyBody.paymentPayload.payload.transaction = signedTxBase64;
-
-    const paymentSignatureHeader = JSON.stringify(verifyBody);
-
-    // Step 5: Submit payment and receive subscription JWT
     const subscribeRes = await axios.post<SubscribeResponse>(url, {}, {
+      timeout: HTTP_TIMEOUT_MS,
       headers: {
         'Content-Type': 'application/json',
         'PAYMENT-SIGNATURE': paymentSignatureHeader,
       },
+      validateStatus: () => true,
     });
+
+    if (subscribeRes.status !== 200) {
+      throw this.apiErrorFromResponse(subscribeRes);
+    }
 
     return this.storeSubscription(subscribeRes.data);
   }
 
-  /**
-   * Return current subscription info (without triggering renewal).
-   * Returns null if no active subscription exists or it has expired.
-   */
   public getActiveSubscription(): SubscriptionInfo | null {
     if (!this.activeSubscription) return null;
     if (this.activeSubscription.expiresAt <= new Date()) {
@@ -182,35 +155,18 @@ export class FifaWorldCupClient {
     return this.activeSubscription;
   }
 
-  // ── Public: Data endpoints ──────────────────────────────────────────────────
-
-  /**
-   * Fetch live betting odds. Auto-subscribes (hourly) if no valid token held.
-   */
-  public async getOdds(targetUrl: string, tier: Tier = 'hourly'): Promise<OddsItem[]> {
-    const res = await this.requestWithToken<{ data: OddsItem[] }>(
-      '/api/v1/odds',
-      { targetUrl },
-      tier,
-    );
+  public async getOdds(targetUrl?: string, tier: Tier = 'hourly'): Promise<OddsItem[]> {
+    const body = targetUrl ? { targetUrl } : {};
+    const res = await this.requestWithToken<{ data: OddsItem[] }>('/api/v1/odds', body, tier);
     return res.data;
   }
 
-  /**
-   * Fetch breaking sports news. Auto-subscribes (hourly) if no valid token held.
-   */
-  public async getNews(targetUrl: string, tier: Tier = 'hourly'): Promise<NewsItem[]> {
-    const res = await this.requestWithToken<{ data: NewsItem[] }>(
-      '/api/v1/news',
-      { targetUrl },
-      tier,
-    );
+  public async getNews(targetUrl?: string, tier: Tier = 'hourly'): Promise<NewsItem[]> {
+    const body = targetUrl ? { targetUrl } : {};
+    const res = await this.requestWithToken<{ data: NewsItem[] }>('/api/v1/news', body, tier);
     return res.data;
   }
 
-  /**
-   * Fetch ticket resale prices. Auto-subscribes (hourly) if no valid token held.
-   */
   public async getTickets(targetUrl: string, tier: Tier = 'hourly'): Promise<TicketItem[]> {
     const res = await this.requestWithToken<{ data: TicketItem[] }>(
       '/api/v1/tickets',
@@ -220,18 +176,11 @@ export class FifaWorldCupClient {
     return res.data;
   }
 
-  // ── Private helpers ─────────────────────────────────────────────────────────
-
-  /**
-   * Ensure a valid subscription token exists, then make the authenticated request.
-   * On 401 TOKEN_EXPIRED, auto-renews and retries once.
-   */
   private async requestWithToken<T>(
     path: string,
     body: Record<string, unknown>,
     tier: Tier,
   ): Promise<T> {
-    // Auto-subscribe if no valid token
     if (!this.getActiveSubscription()) {
       await this.subscribe(tier);
     }
@@ -240,35 +189,49 @@ export class FifaWorldCupClient {
     const bearerToken = this.activeSubscription!.token;
 
     const res = await axios.post<T>(url, body, {
+      timeout: HTTP_TIMEOUT_MS,
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${bearerToken}`,
       },
-      validateStatus: (s) => s === 200 || s === 401,
+      validateStatus: () => true,
     });
 
     if (res.status === 200) {
       return res.data;
     }
 
-    // 401: token expired or revoked — renew and retry once
-    const errData = res.data as { error?: string };
-    if (errData.error === 'TOKEN_EXPIRED' || errData.error === 'TOKEN_REVOKED') {
-      console.log(`[FifaWorldCupClient] Token ${errData.error} — renewing subscription...`);
-      this.activeSubscription = null;
-      await this.subscribe(tier);
+    if (res.status === 401) {
+      const errData = res.data as { error?: string };
+      if (errData.error === 'TOKEN_EXPIRED' || errData.error === 'TOKEN_REVOKED') {
+        this.log(`Token ${errData.error} — renewing subscription...`);
+        this.activeSubscription = null;
+        await this.subscribe(tier);
 
-      // Retry with fresh token
-      const retryRes = await axios.post<T>(url, body, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.activeSubscription!.token}`,
-        },
-      });
-      return retryRes.data;
+        const retryRes = await axios.post<T>(url, body, {
+          timeout: HTTP_TIMEOUT_MS,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.activeSubscription!.token}`,
+          },
+          validateStatus: () => true,
+        });
+
+        if (retryRes.status === 200) {
+          return retryRes.data;
+        }
+        throw this.apiErrorFromResponse(retryRes);
+      }
     }
 
-    throw new Error(`Request failed (${res.status}): ${JSON.stringify(res.data)}`);
+    throw this.apiErrorFromResponse(res);
+  }
+
+  private apiErrorFromResponse(res: AxiosResponse): FifaApiError {
+    const data = res.data as { error?: string; message?: string } | undefined;
+    const code = data?.error;
+    const message = data?.message || JSON.stringify(data) || `HTTP ${res.status}`;
+    return new FifaApiError(res.status, message, code);
   }
 
   private storeSubscription(data: SubscribeResponse): SubscriptionInfo {
@@ -278,8 +241,8 @@ export class FifaWorldCupClient {
       expiresAt: new Date(data.expiresAt),
     };
     this.activeSubscription = info;
-    console.log(
-      `[FifaWorldCupClient] Subscription active — tier: ${data.tier} (${data.tierLabel}), expires: ${data.expiresAt}`,
+    this.log(
+      `Subscription active — tier: ${data.tier} (${data.tierLabel}), expires: ${data.expiresAt}`,
     );
     return info;
   }

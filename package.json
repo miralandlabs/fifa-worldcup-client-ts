@@ -4,6 +4,13 @@
   "type": "module",
   "main": "dist/client.js",
   "types": "dist/client.d.ts",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "demo": "tsx src/demo.ts",

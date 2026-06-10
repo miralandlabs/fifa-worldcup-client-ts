@@ -12,5 +12,6 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/client.ts", "src/pr402-defaults.ts", "src/pr402-exact-flow.ts"],
+  "exclude": ["src/test.ts", "src/demo.ts"]
 }

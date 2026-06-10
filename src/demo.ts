@@ -29,6 +29,7 @@ async function run() {
     payerKeypair: buyerKeypair,
     endpointBaseUrl,
     defaultFacilitatorUrl: process.env.FACILITATOR_BASE_URL || 'https://preview.ipay.sh',
+    logger: (msg) => console.log(`   ${msg}`),
   });
   console.log(`✅ API endpoint: ${endpointBaseUrl}`);
   console.log('');
@@ -54,17 +55,8 @@ async function run() {
   // ── 4. Call data endpoints — no x402 payments needed ────────────────────
 
   try {
-    console.log('📊 1/3 — Fetching live betting odds...');
-    const odds = await client.getOdds('https://www.pinnacle.com/en/soccer/fifa-world-cup/matchups');
-    console.log(`   ✅ Received ${odds.length} odds items.`);
-    if (odds.length > 0) console.dir(odds.slice(0, 2), { depth: null });
-  } catch (err: any) {
-    console.error(`   ❌ Failed: ${err.message}`);
-  }
-
-  try {
-    console.log('📰 2/3 — Fetching breaking news & sentiment...');
-    const news = await client.getNews('https://www.fifa.com/en/news');
+    console.log('📰 1/2 — Fetching default news (curated RSS feeds)...');
+    const news = await client.getNews();
     console.log(`   ✅ Received ${news.length} articles.`);
     if (news.length > 0) console.dir(news.slice(0, 2), { depth: null });
   } catch (err: any) {
@@ -72,8 +64,25 @@ async function run() {
   }
 
   try {
-    console.log('🎟️  3/3 — Fetching ticket resale prices...');
-    const tickets = await client.getTickets('https://www.stubhub.com/fifa-world-cup-tickets');
+    console.log('📰 2/2 — Fetching BBC Sport Football RSS...');
+    const bbc = await client.getNews('https://feeds.bbci.co.uk/sport/football/rss.xml');
+    console.log(`   ✅ Received ${bbc.length} articles.`);
+    if (bbc.length > 0) console.dir(bbc.slice(0, 2), { depth: null });
+  } catch (err: any) {
+    console.error(`   ❌ Failed: ${err.message}`);
+  }
+
+  try {
+    console.log('📊 (optional) — Fetching odds via BYO URL (may return empty for bot-blocked sites)...');
+    const odds = await client.getOdds('https://www.example.com/odds');
+    console.log(`   ✅ Received ${odds.length} odds items.`);
+  } catch (err: any) {
+    console.error(`   ❌ Failed: ${err.message}`);
+  }
+
+  try {
+    console.log('🎟️  (optional) — Ticket scrape BYO URL...');
+    const tickets = await client.getTickets('https://www.example.com/tickets');
     console.log(`   ✅ Received ${tickets.length} listings.`);
     if (tickets.length > 0) console.dir(tickets.slice(0, 2), { depth: null });
   } catch (err: any) {
@@ -82,7 +91,7 @@ async function run() {
 
   console.log('');
   console.log('='.repeat(55));
-  console.log('✅ Demo complete. Only ONE x402 payment was made for all 3 queries.');
+  console.log('✅ Demo complete. Only ONE x402 payment was made for all queries.');
 
   // Show remaining subscription time
   const active = client.getActiveSubscription();
